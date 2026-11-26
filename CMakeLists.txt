@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.22)
 set(CMAKE_OSX_DEPLOYMENT_TARGET "11.0" CACHE STRING "Minimum macOS version")
 set(CMAKE_OSX_ARCHITECTURES "arm64;x86_64" CACHE STRING "Universal binary")
 
-project(AutoEQ VERSION 1.0.1)
+project(AutoEQ VERSION 1.1.0)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 option(AUTOEQ_COPY_PLUGIN_AFTER_BUILD "Copy built plugins into local plug-in folders" ON)
@@ -70,7 +70,7 @@ if(AUTOEQ_BUILD_TEST)
     juce_add_console_app(AutoEQTest PRODUCT_NAME "AutoEQTest")
     target_sources(AutoEQTest PRIVATE Test/Main.cpp ${AUTOEQ_SOURCES})
     target_compile_definitions(AutoEQTest PRIVATE JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0 JUCE_STANDALONE_APPLICATION=1
-        AUTOEQ_TEST=1 JucePlugin_VersionString="1.0.1" JUCE_MODAL_LOOPS_PERMITTED=1)
+        AUTOEQ_TEST=1 JucePlugin_VersionString="1.1.0" JUCE_MODAL_LOOPS_PERMITTED=1)
     target_compile_features(AutoEQTest PRIVATE cxx_std_17)
     target_link_libraries(AutoEQTest PRIVATE AutoEQData juce::juce_audio_utils juce::juce_dsp juce::juce_cryptography juce::juce_recommended_config_flags)
 endif()

@@ -244,7 +244,8 @@ public:
         }
         const bool locked = (bool) b.getProperties().getWithDefault ("locked", false);
         const bool on  = b.getToggleState() && ! locked;
-        const bool lit = on || ((bool) b.getProperties().getWithDefault ("lit", false) && ! locked);
+        const bool lit = b.getProperties().contains ("lampState") ? ((bool) b.getProperties()["lampState"] && ! locked)
+                                                                   : (on || ((bool) b.getProperties().getWithDefault ("lit", false) && ! locked));
         auto r = b.getLocalBounds().toFloat().reduced (1.0f).withTrimmedBottom (3.0f);
         if (on || down) r.translate (0.0f, 2.0f);
         const bool small = r.getHeight() < 34.0f;
@@ -278,9 +279,10 @@ SegmentControl::SegmentControl (juce::RangedAudioParameter& param, juce::StringA
 {
     for (int i = 0; i < labels.size(); ++i)
     {
-        auto* b = buttons.add (new juce::TextButton (labels[i]));
-        b->onClick = [this, i]
+        auto* b = buttons.add (new Key (labels[i]));
+        b->onClick = [this, i, b]
         {
+            if (onLampClick && b->downOnLamp) { b->downOnLamp = false; onLampClick (i); showValue (shown); return; }
             if (allowValue && ! allowValue (i)) { showValue (shown); return; }
             attachment.setValueAsCompleteGesture ((float) i);
         };
@@ -294,6 +296,16 @@ void SegmentControl::showValue (int v)
     shown = v;
     for (int i = 0; i < buttons.size(); ++i)
         if (buttons[i]->getToggleState() != (i == v)) buttons[i]->setToggleState (i == v, juce::dontSendNotification);
+}
+
+void SegmentControl::setLamp (int value, bool on)
+{
+    if (auto* b = buttons[value])
+        if (! b->getProperties().contains ("lampState") || (bool) b->getProperties()["lampState"] != on)
+        {
+            b->getProperties().set ("lampState", on);
+            b->repaint();
+        }
 }
 
 void SegmentControl::setLocked (int value, bool locked)
@@ -635,7 +647,7 @@ void SpectrumDisplay::update (int m, bool u)
         };
         follow (in[i], e.dispIn[(size_t) i].load (std::memory_order_relaxed), 0.35f);
         follow (sc[i], e.dispSc[(size_t) i].load (std::memory_order_relaxed), 0.35f);
-        const float r = e.dispRed[(size_t) i].load (std::memory_order_relaxed);
+        const float r = (mode == spaceMode ? e.dispCarve : e.dispRed)[(size_t) i].load (std::memory_order_relaxed);
         red[i] += (r - red[i]) * 0.6f;
     }
     // The sound after AutoEQ
@@ -1064,6 +1076,22 @@ AutoEQAudioProcessorEditor::AutoEQAudioProcessorEditor (AutoEQAudioProcessor& p)
         return false;
     };
 
+    // The light strip on each key is that section's ON switch (several can be on: AUTO + EQ + SPACE).
+    modeKeys.onLampClick = [this] (int v)
+    {
+        if (! gate::modeAllowed (v, proc.unlocked.load()))
+        {
+            openPro (juce::String (modeName (v)) + (v == spaceMode ? " (SIDECHAIN CARVING) IS AN UPGRADE FEATURE" : " (DYNAMIC EQ) IS AN UPGRADE FEATURE"));
+            return;
+        }
+        const char* ids[] = { "autoOn", "eqOn", "spaceOn" };
+        setSwitch (v, P (proc, ids[v]).getValue() < 0.5f);
+    };
+    turnOnButton.getProperties().set ("lit", true);
+    turnOnButton.setTooltip ("Switch this section on. The light on its key at the top turns it on and off too.");
+    turnOnButton.onClick = [this] { setSwitch (proc.resolve (proc.unlocked.load()).mode, true); };
+    addChildComponent (turnOnButton);
+
     learnButton.setTooltip ("Listen for 8 seconds and mark the frequencies that ring the most");
     learnButton.onClick = [this] { proc.requestLearn(); };
     addAndMakeVisible (learnButton);
@@ -1149,6 +1177,21 @@ AutoEQAudioProcessorEditor::AutoEQAudioProcessorEditor (AutoEQAudioProcessor& p)
 }
 
 AutoEQAudioProcessorEditor::~AutoEQAudioProcessorEditor() { setLookAndFeel (nullptr); }
+
+void AutoEQAudioProcessorEditor::setSwitch (int section, bool on)
+{
+    const char* ids[] = { "autoOn", "eqOn", "spaceOn" };
+    auto& prm = P (proc, ids[juce::jlimit (0, 2, section)]);
+    prm.beginChangeGesture();
+    prm.setValueNotifyingHost (on ? 1.0f : 0.0f);
+    prm.endChangeGesture();
+}
+
+bool AutoEQAudioProcessorEditor::viewOn() const
+{
+    const auto e = proc.resolve (proc.unlocked.load());
+    return e.mode == eqMode ? e.eqOn : e.mode == spaceMode ? e.spaceOn : e.autoOn;
+}
 
 AutoEQAudioProcessorEditor::Knob& AutoEQAudioProcessorEditor::addKnob (const juce::String& key, const juce::String& id, const juce::String& label,
                                                                        int modeMask, juce::StringArray steps)
@@ -1252,6 +1295,7 @@ void AutoEQAudioProcessorEditor::layoutForMode()
         for (auto* b : bandKeys) { b->setBounds (bx, stripArea.getY(), 40, 32); bx += 46; }
         bandOnButton.setBounds (bx + 10, stripArea.getY(), 56, 32);
         learnToEqButton.setBounds (stripArea.getRight() - 170, stripArea.getY(), 170, 32);
+        turnOnButton.setBounds (learnToEqButton.getX() - 124, stripArea.getY(), 112, 32);
     }
     else
     {
@@ -1272,6 +1316,7 @@ void AutoEQAudioProcessorEditor::layoutForMode()
             place ("splow", secB.getX(), 100, D); place ("sphigh", secB.getX() + 100, 100, D);
         }
         place ("mix", secC.getX() + 2, 104, D); place ("output", secC.getX() + 106, 104, D);
+        turnOnButton.setBounds (stripArea.getRight() - 112, stripArea.getY(), 112, 32);
         deltaButton.setBounds (secC.getRight() - 78, top - 2, 78, 30);
     }
     repaint();
@@ -1409,6 +1454,9 @@ void AutoEQAudioProcessorEditor::timerCallback()
     if (e.mode != shownMode) layoutForMode();
     updateLocks();
     modeKeys.showValue (e.mode);
+    modeKeys.setLamp (autoMode, e.autoOn); modeKeys.setLamp (eqMode, e.eqOn); modeKeys.setLamp (spaceMode, e.spaceOn);
+    const bool vOn = e.mode == eqMode ? e.eqOn : e.mode == spaceMode ? e.spaceOn : e.autoOn;
+    turnOnButton.setVisible (! vOn);
 
     // Locked dials show what actually runs.
     auto shown = [&] (const char* key, float plain)
@@ -1432,13 +1480,24 @@ void AutoEQAudioProcessorEditor::timerCallback()
         const bool cut = typeIsCut (bs.type), eqm = e.mode == eqMode;
         knob ("Gain")->slider.setVisible (eqm && ! cut);
         knob ("Slope")->slider.setVisible (eqm && cut);
-        knob ("Gain")->slider.setAlpha (bs.type == notch ? 0.35f : 1.0f);
-        knob ("Q")->slider.setAlpha (cut ? 0.35f : 1.0f);
+        const float dim = vOn ? 1.0f : 0.4f;   // EQ switched off: everything dimmed
+        auto alpha = [] (Knob* k, float a) { if (std::abs (k->slider.getAlpha() - a) > 1.0e-3f) k->slider.setAlpha (a); };
+        for (auto* key : { "Type", "Freq", "Slope" }) alpha (knob (key), dim);
+        alpha (knob ("Gain"), (bs.type == notch ? 0.35f : 1.0f) * dim);
+        alpha (knob ("Q"), (cut ? 0.35f : 1.0f) * dim);
         const bool dynOk = typeCanBeDynamic (bs.type);
         dynButton.setEnabled (dynOk);
         for (auto* key : { "Thr", "Ratio", "Range", "Atk", "Rel" })
-            knob (key)->slider.setAlpha (bs.dyn && dynOk ? 1.0f : 0.4f);
+            alpha (knob (key), (bs.dyn && dynOk ? 1.0f : 0.4f) * dim);
         learnToEqButton.setEnabled (proc.spectral.learnState.load() == 2 && proc.spectral.numProblems.load() > 0);
+    }
+    // The section on screen is switched off: its controls are dimmed (turning them doesn't switch it on).
+    for (auto* k : knobs)
+    {
+        if (k->modeMask == (mAuto | mEq | mSpace)) continue;   // OUTPUT is for everything
+        if (k->bandKnob) continue;                              // set above
+        const float want = vOn ? 1.0f : 0.4f;
+        if (std::abs (k->slider.getAlpha() - want) > 1.0e-3f) k->slider.setAlpha (want);
     }
 
     deltaButton.setToggleState (e.delta, juce::dontSendNotification);
@@ -1469,6 +1528,11 @@ void AutoEQAudioProcessorEditor::timerCallback()
         ledText = pr <= 0.0f ? juce::String ("PRESS PLAY") : juce::String::fromUTF8 ("LISTENING\xe2\x80\xa6 ") + juce::String (juce::roundToInt (pr * 100.0f)) + "%";
         ledProgress = pr;
     }
+    else if (! vOn)
+    {
+        ledLabel = modeName (e.mode);
+        ledText = "SWITCHED OFF";
+    }
     else if (e.mode == eqMode)
     {
         const auto& bs = e.eq[(size_t) boundBand];
@@ -1489,9 +1553,10 @@ void AutoEQAudioProcessorEditor::timerCallback()
     }
     else
     {
-        const float cut = proc.spectral.maxCutDb.load();
-        ledLabel = juce::String (e.mode == spaceMode ? "SPACE" : "AUTO") + (e.delta ? dot + "DELTA" : juce::String());
-        if (cut > 0.3f) ledText = juce::String (e.mode == spaceMode ? "CARVING AT " : "CUTTING AT ") + fmtHz (proc.spectral.maxCutHz.load());
+        const bool sp = e.mode == spaceMode;
+        const float cut = sp ? proc.spectral.maxCarveDb.load() : proc.spectral.maxCutDb.load();
+        ledLabel = juce::String (sp ? "SPACE" : "AUTO") + (e.delta ? dot + "DELTA" : juce::String());
+        if (cut > 0.3f) ledText = juce::String (sp ? "CARVING AT " : "CUTTING AT ") + fmtHz (sp ? proc.spectral.maxCarveHz.load() : proc.spectral.maxCutHz.load());
         else ledText = e.mode == spaceMode ? "WAITING FOR THE SIDECHAIN" : "NOTHING RINGING";
         ledRightLabel = "CUT";
         ledRightText = cut > 0.05f ? "-" + juce::String (cut, 1) : juce::String ("0");
@@ -1588,19 +1653,19 @@ void AutoEQAudioProcessorEditor::paint (juce::Graphics& g)
         g.fillRect ((float) s.getX() - 0.5f, (float) s.getY(), 1.0f, (float) s.getHeight() - 10.0f);
     if (mode == eqMode)
     {
-        title (secA, "BAND " + juce::String (boundBand + 1), true, 0, false);
+        title (secA, "BAND " + juce::String (boundBand + 1), viewOn(), 0, false);
         title (secB, "DYNAMIC", proc.resolve (u).eq[(size_t) boundBand].dyn, 16, false);
         title (secC, "OUT", true, 12, false);
     }
     else if (mode == spaceMode)
     {
-        title (secA, "SPACE", true, 0, false);
+        title (secA, "SPACE", viewOn(), 0, false);
         title (secB, "RANGE", true, 18, false);
         title (secC, "OUTPUT", true, 18, false);
     }
     else
     {
-        title (secA, "RESONANCES", true, 0, false);
+        title (secA, "RESONANCES", viewOn(), 0, false);
         title (secB, "FOCUS", u, 18, ! u && gate::upgradeFocus);
         title (secC, "OUTPUT", true, 18, false);
     }

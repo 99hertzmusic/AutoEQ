@@ -10,7 +10,10 @@
 #include "ParametricEQ.h"
 #include "Licence/Licence.h"
 
-// AutoEQ: one plugin, three modes.
+// AutoEQ: one plugin, three sections that can run together (26 Nov 2026: AUTO, EQ and SPACE each have an ON switch;
+// "mode" is now only which section's controls are on screen).
+// Signal path: EQ (IIR, no latency) -> one STFT pass where the AUTO and SPACE gains multiply per bin (latency N,
+// the same whatever is on). AUTO's analysis and LEARN see the EQ'd sound. MIX / DELTA apply to the STFT part.
 //  AUTO  (free with fixed settings): finds resonant peaks above the sound's smoothed spectrum and turns them down
 //        only while they ring (soothe-style). LEARN listens for 8 s and marks the worst frequencies.
 //  EQ    (upgrade): 8-band parametric EQ (MusicStation's EQ), every bell / shelf can be dynamic.
@@ -58,7 +61,8 @@ public:
     // ── What actually runs, after the free / upgrade gate ──────────────────
     struct Effective
     {
-        int mode = aeq::autoMode;
+        int mode = aeq::autoMode;          // the section on screen (a locked one shows AUTO)
+        bool autoOn = true, eqOn = false, spaceOn = false;   // what runs, after the gate
         aeq::SpectralSettings spectral;
         aeq::EQShape eq;
         float mix = 1.0f, outputDb = 0.0f;
@@ -92,6 +96,10 @@ public:
 private:
     juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout();
     void restoreLearned (const juce::ValueTree& t);
+public:
+    // Sessions saved before the ON switches (1.0.0/1.0.1) only have "mode": that section becomes the one switched on.
+    static void migrateOldState (juce::ValueTree& tree);
+private:
 
     struct BandParams
     {
@@ -101,6 +109,7 @@ private:
         std::atomic<float>* range = nullptr; std::atomic<float>* atk = nullptr; std::atomic<float>* rel = nullptr;
     };
     std::array<BandParams, aeq::numBands> bp;
+    std::atomic<float>* pAutoOn = nullptr; std::atomic<float>* pEqOn = nullptr; std::atomic<float>* pSpaceOn = nullptr;
     std::atomic<float>* pMode = nullptr; std::atomic<float>* pDepth = nullptr; std::atomic<float>* pSharp = nullptr;
     std::atomic<float>* pSelect = nullptr; std::atomic<float>* pSpeed = nullptr; std::atomic<float>* pLow = nullptr;
     std::atomic<float>* pHigh = nullptr; std::atomic<float>* pAmount = nullptr; std::atomic<float>* pSpLow = nullptr;
@@ -113,7 +122,7 @@ private:
     int dryPos = 0;
     juce::AudioBuffer<float> dryBuf, eqBuf;
     float eqWeight = 0.0f, eqWeightStep = 0.001f;
-    juce::SmoothedValue<float> sOut, sEqMix, sEqDelta;
+    juce::SmoothedValue<float> sOut;
     int selfBlocks = 0; juce::int64 silentSamples = 0;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (AutoEQAudioProcessor)

@@ -14,11 +14,22 @@ public:
     SegmentControl (juce::RangedAudioParameter& param, juce::StringArray labels);
     void resized() override;
     void setLocked (int value, bool locked);          // padlock on that key
-    void showValue (int value);                       // which key is lit (the value that actually runs)
+    void showValue (int value);                       // which key is pressed in (the value that actually runs)
     std::function<bool (int value)> allowValue;       // return false to refuse a click (locked value)
+    // Optional light strip: when set, each key's lamp shows setLamp() (not the selection), and a click on the
+    // top part of a key (the lamp, lampZone px) calls onLampClick instead of selecting it.
+    std::function<void (int value)> onLampClick;
+    void setLamp (int value, bool on);
+    static constexpr int lampZone = 24;
     int gap = 8;
+    struct Key : juce::TextButton
+    {
+        using juce::TextButton::TextButton;
+        bool downOnLamp = false;
+        void mouseDown (const juce::MouseEvent& e) override { downOnLamp = e.y < lampZone; juce::TextButton::mouseDown (e); }
+    };
 private:
-    juce::OwnedArray<juce::TextButton> buttons;
+    juce::OwnedArray<Key> buttons;
     juce::ParameterAttachment attachment;
     int shown = -1;
 };
@@ -143,7 +154,9 @@ private:
 
     SegmentControl modeKeys;
     juce::TextButton learnButton { "LEARN" }, deltaButton { "DELTA" }, dynButton { "DYNAMIC" }, bandOnButton { "ON" },
-                     learnToEqButton { "ADD LEARNED CUTS" };
+                     learnToEqButton { "ADD LEARNED CUTS" }, turnOnButton { "TURN ON" };
+    bool viewOn() const;   // is the section on screen switched on (and allowed)?
+    void setSwitch (int section, bool on);
     juce::OwnedArray<juce::TextButton> bandKeys;
     std::unique_ptr<juce::ButtonParameterAttachment> deltaAtt, dynAtt, bandOnAtt;
     SpectrumDisplay display;

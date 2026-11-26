@@ -9,7 +9,9 @@
 //    curve is smooth in both directions: no musical noise, no long filter tails (time aliasing) on transients.
 //  - SPACE: the sidechain's smoothed spectrum, relative to its own loudest part, sets how deep THIS track is carved
 //    at each frequency (up to AMOUNT). Optional mid-only / side-only carving.
-//  - Analysis always runs (for the display and LEARN), whatever the mode.
+//  - AUTO and SPACE are independent switches (26 Nov 2026): each has its own cut per bin with its own attack /
+//    release, and the two gains multiply in the same STFT pass (no extra latency). Off = its cut glides to 0.
+//  - Analysis always runs (for the display and LEARN), whatever is switched on.
 #include <juce_dsp/juce_dsp.h>
 #include <array>
 #include <atomic>
@@ -20,7 +22,8 @@ namespace aeq
 {
 struct SpectralSettings
 {
-    int   mode = autoMode;            // autoMode or spaceMode decide the gain; eqMode = analysis only (gain 1)
+    bool  autoOn = true;              // AUTO cut on
+    bool  spaceOn = false;            // SPACE carve on
     // AUTO
     float depth = 0.5f;               // 0..1
     float sharpness = 0.5f;           // 0..1 (narrower envelope + narrower cuts)
@@ -50,8 +53,9 @@ public:
     // ── Display (written once per frame by the audio thread) ──
     static constexpr int numDisplay = 240;
     static double displayFreq (int i) { return 20.0 * std::pow (1000.0, (double) i / (numDisplay - 1)); }
-    std::array<std::atomic<float>, numDisplay> dispIn, dispSc, dispRed;   // dBFS, dBFS, dB of cut (>= 0)
-    std::atomic<float> maxCutDb { 0.0f }, maxCutHz { 1000.0f };
+    std::array<std::atomic<float>, numDisplay> dispIn, dispSc, dispRed, dispCarve;   // dBFS, dBFS, dB of AUTO cut, dB of SPACE carve
+    std::atomic<float> maxCutDb { 0.0f }, maxCutHz { 1000.0f };       // AUTO
+    std::atomic<float> maxCarveDb { 0.0f }, maxCarveHz { 1000.0f };   // SPACE
     std::atomic<int>   frameCount { 0 };
 
     // ── LEARN: average resonance excess over ~8 s of sound, then the worst few frequencies ──
@@ -75,7 +79,8 @@ private:
     void envelopeCQ (const float* in, float* out, float halfOct, int minHalfBins);  // constant-Q local line fit
     void ringMax (const float* in, float* out, float halfOct, int minHalfBins, int skip, float skipOct);
     void dilateCQ (const float* in, float* out, float halfOct, int minHalfBins);  // constant-Q moving max
-    void exportDisplay (int mode);
+    void exportDisplay();
+    void computeExcessOnly();   // LEARN's resonance measure when AUTO is off
     void learnAccumulate (bool active);
     void learnFinish();
 
@@ -94,6 +99,8 @@ private:
 
     // Per-bin state (K + 1 bins)
     std::vector<float> prevRaw, rise, slowEx, hold, pDet, levelDb, env1, envDb, clipped, excess, target, dil, red, scDb, scSmooth, mainDb, gainNow, tmp;
+    std::vector<float> targetSp, redSp, gainSp;   // SPACE: its own target, carve and gain per bin
+    bool spaceActive = false;                     // SPACE on, or its carve still gliding out
     std::vector<double> prefix, envX, pX, pXX, pY, pXY;
     std::vector<float> sparse;                    // sparse table for the moving max
     int sparseLevels = 0;

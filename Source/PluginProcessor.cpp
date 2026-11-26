@@ -12,7 +12,7 @@ AutoEQAudioProcessor::AutoEQAudioProcessor()
       apvts (*this, nullptr, "AutoEQState", createParameterLayout())
 {
     auto raw = [this] (const juce::String& id) { return apvts.getRawParameterValue (id); };
-    pMode = raw ("mode"); pDepth = raw ("depth"); pSharp = raw ("sharpness"); pSelect = raw ("selectivity");
+    pMode = raw ("mode"); pAutoOn = raw ("autoOn"); pEqOn = raw ("eqOn"); pSpaceOn = raw ("spaceOn"); pDepth = raw ("depth"); pSharp = raw ("sharpness"); pSelect = raw ("selectivity");
     pSpeed = raw ("speed"); pLow = raw ("low"); pHigh = raw ("high"); pAmount = raw ("amount");
     pSpLow = raw ("splow"); pSpHigh = raw ("sphigh"); pSpSpeed = raw ("spspeed"); pStereo = raw ("stereo");
     pMix = raw ("mix"); pDelta = raw ("delta"); pOutput = raw ("output");
@@ -58,7 +58,8 @@ juce::AudioProcessorValueTreeState::ParameterLayout AutoEQAudioProcessor::create
     auto ms  = [] { return AudioParameterFloatAttributes().withLabel ("ms")
                         .withStringFromValueFunction ([] (float v, int) { return v < 10.0f ? String (v, 1) : String (roundToInt (v)); }); };
 
-    l.add (std::make_unique<AudioParameterChoice> (id ("mode"), "Mode", StringArray { "Auto", "EQ", "Space" }, 0));
+    // "mode" = which section is on screen (kept under its old ID so old sessions and automation still load).
+    l.add (std::make_unique<AudioParameterChoice> (id ("mode"), "View", StringArray { "Auto", "EQ", "Space" }, 0));
     // AUTO
     l.add (std::make_unique<AudioParameterFloat> (id ("depth"), "Depth", NormalisableRange<float> (0.0f, 100.0f, 0.1f), 50.0f, pct()));
     l.add (std::make_unique<AudioParameterFloat> (id ("sharpness"), "Sharpness", NormalisableRange<float> (0.0f, 100.0f, 0.1f), freeValue::sharpness, pct()));
@@ -100,6 +101,10 @@ juce::AudioProcessorValueTreeState::ParameterLayout AutoEQAudioProcessor::create
         l.add (std::make_unique<AudioParameterFloat> (id (bandId (b, "Atk")), n + "Attack", logRange (0.5f, 200.0f), 10.0f, ms()));
         l.add (std::make_unique<AudioParameterFloat> (id (bandId (b, "Rel")), n + "Release", logRange (10.0f, 2000.0f), 120.0f, ms()));
     }
+    // ON switches (added 26 Nov 2026, at the end so every older parameter keeps its place). Default = today's sound.
+    l.add (std::make_unique<AudioParameterBool> (id ("autoOn"), "Auto On", true));
+    l.add (std::make_unique<AudioParameterBool> (id ("eqOn"), "EQ On", false));
+    l.add (std::make_unique<AudioParameterBool> (id ("spaceOn"), "Space On", false));
     return l;
 }
 
@@ -108,8 +113,11 @@ AutoEQAudioProcessor::Effective AutoEQAudioProcessor::resolve (bool u) const
 {
     Effective e;
     e.mode = gate::effectiveMode (juce::jlimit (0, numModes - 1, (int) pMode->load()), u);
+    e.autoOn  = pAutoOn->load() > 0.5f  && gate::modeAllowed (autoMode, u);
+    e.eqOn    = pEqOn->load() > 0.5f    && gate::modeAllowed (eqMode, u);
+    e.spaceOn = pSpaceOn->load() > 0.5f && gate::modeAllowed (spaceMode, u);
     auto& s = e.spectral;
-    s.mode = e.mode;
+    s.autoOn = e.autoOn; s.spaceOn = e.spaceOn;
     s.depth       = juce::jlimit (0.0f, 1.0f, pDepth->load() / 100.0f);
     s.sharpness   = ((u || ! gate::upgradeSharpness)   ? pSharp->load()  : freeValue::sharpness) / 100.0f;
     s.selectivity = ((u || ! gate::upgradeSelectivity) ? pSelect->load() : freeValue::selectivity) / 100.0f;
@@ -125,6 +133,7 @@ AutoEQAudioProcessor::Effective AutoEQAudioProcessor::resolve (bool u) const
     s.sidechainOk = sidechainConnected.load() && ! sidechainIsSelf.load();
     e.mix = juce::jlimit (0.0f, 1.0f, pMix->load() / 100.0f);
     e.delta = (u || ! gate::upgradeDelta) ? pDelta->load() > 0.5f : false;
+    if (! e.autoOn && ! e.spaceOn) e.delta = false;   // nothing taken out: DELTA would only be silence
     s.mix = e.mix; s.delta = e.delta;
     e.outputDb = pOutput->load();
 
@@ -158,11 +167,10 @@ void AutoEQAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBlock
     dryBuf.setSize (2, maxBlock, false, true, false);
     eqBuf.setSize (2, maxBlock, false, true, false);
     const auto e = resolve (unlocked.load());
-    eqWeight = e.mode == eqMode ? 1.0f : 0.0f;
+    eqWeight = e.eqOn ? 1.0f : 0.0f;
     eqWeightStep = (float) (1.0 / (0.04 * sampleRate));
+    eq.reset();
     sOut.reset (sampleRate, 0.05);    sOut.setCurrentAndTargetValue (juce::Decibels::decibelsToGain (e.outputDb));
-    sEqMix.reset (sampleRate, 0.03);  sEqMix.setCurrentAndTargetValue (1.0f);
-    sEqDelta.reset (sampleRate, 0.03); sEqDelta.setCurrentAndTargetValue (0.0f);
     selfBlocks = 0; silentSamples = (juce::int64) (10 * sampleRate);
 }
 
@@ -236,7 +244,7 @@ void AutoEQAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce:
     float inPk = 0.0f;
     for (int c = 0; c < numCh; ++c) inPk = juce::jmax (inPk, buffer.getMagnitude (c, 0, n));
 
-    // Delayed dry (lines up with the spectral output)
+    // Delayed dry (keeps the bypass line current, so bypass lines up with the processed output)
     for (int c = 0; c < numCh; ++c)
     {
         const float* in = buffer.getReadPointer (c);
@@ -251,40 +259,29 @@ void AutoEQAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce:
     }
     dryPos = (dryPos + n) % latency;
 
-    // Spectral engine (AUTO / SPACE; in EQ mode it only analyses and passes the sound through)
     float* io[2] = { buffer.getWritePointer (0), buffer.getWritePointer (numCh > 1 ? 1 : 0) };
-    const float* scp[2] = { scCh > 0 ? sc.getReadPointer (0) : nullptr, scCh > 1 ? sc.getReadPointer (1) : (scCh > 0 ? sc.getReadPointer (0) : nullptr) };
-    spectral.process (io, numCh, scCh > 0 ? scp : nullptr, scCh, n, spec);
 
-    // EQ path on the delayed dry, cross-faded in and out with the mode (40 ms).
-    const float eqTarget = e.mode == eqMode ? 1.0f : 0.0f;
-    // (MIX and DELTA belong to AUTO / SPACE; the EQ is always fully on)
-    sEqMix.setTargetValue (1.0f);
-    sEqDelta.setTargetValue (0.0f);
+    // 1. EQ first (IIR, no latency), cross-faded in and out with its switch (40 ms). The EQ is always fully on:
+    //    MIX and DELTA belong to the spectral part.
+    const float eqTarget = e.eqOn ? 1.0f : 0.0f;
     if (eqTarget > 0.0f || eqWeight > 0.0f)
     {
-        for (int c = 0; c < numCh; ++c) eqBuf.copyFrom (c, 0, dryBuf, c, 0, n);
+        for (int c = 0; c < numCh; ++c) eqBuf.copyFrom (c, 0, io[c], n);
         float* eqp[2] = { eqBuf.getWritePointer (0), eqBuf.getWritePointer (1) };
         eq.process (eqp, numCh, n, e.eq);
         for (int i = 0; i < n; ++i)
         {
-            const float m = sEqMix.getNextValue(), d = sEqDelta.getNextValue();
             if (eqWeight < eqTarget) eqWeight = juce::jmin (eqTarget, eqWeight + eqWeightStep);
             else if (eqWeight > eqTarget) eqWeight = juce::jmax (eqTarget, eqWeight - eqWeightStep);
             for (int c = 0; c < numCh; ++c)
-            {
-                const float dry = dryBuf.getSample (c, i);
-                const float wet = dry + m * (eqBuf.getSample (c, i) - dry);
-                const float y = wet + d * (dry - 2.0f * wet);
-                io[c][i] = io[c][i] + (y - io[c][i]) * eqWeight;
-            }
+                io[c][i] = io[c][i] + (eqBuf.getSample (c, i) - io[c][i]) * eqWeight;
         }
         if (eqWeight <= 0.0f && eqTarget <= 0.0f) eq.reset();   // next time it starts on its settings, no glide
     }
-    else
-    {
-        sEqMix.skip (n); sEqDelta.skip (n);
-    }
+
+    // 2. One STFT pass on the EQ'd sound: AUTO x SPACE gains per bin (analysis + LEARN always run).
+    const float* scp[2] = { scCh > 0 ? sc.getReadPointer (0) : nullptr, scCh > 1 ? sc.getReadPointer (1) : (scCh > 0 ? sc.getReadPointer (0) : nullptr) };
+    spectral.process (io, numCh, scCh > 0 ? scp : nullptr, scCh, n, spec);
 
     // Output level
     sOut.setTargetValue (juce::Decibels::decibelsToGain (e.outputDb));
@@ -348,7 +345,7 @@ int AutoEQAudioProcessor::learnedToEQ()
             prm->endChangeGesture();
         }
     };
-    // The four middle bands (3-6) become narrow dynamic cuts at the worst frequencies.
+    // The four middle bands (3-6) become narrow dynamic cuts at the worst frequencies, and the EQ is switched on.
     int used = 0;
     for (int b = 2; b < 6 && used < (int) ps.size(); ++b, ++used)
     {
@@ -365,6 +362,7 @@ int AutoEQAudioProcessor::learnedToEQ()
         set (bandId (b, "Atk"), 5.0f);
         set (bandId (b, "Rel"), 120.0f);
     }
+    if (used > 0) set ("eqOn", 1.0f);
     return used;
 }
 
@@ -413,8 +411,27 @@ void AutoEQAudioProcessor::setStateInformation (const void* data, int sizeInByte
     auto tree = juce::ValueTree::fromXml (*xml);
     const auto learned = tree.getChildWithName ("Learned").createCopy();
     tree.removeChild (tree.getChildWithName ("Learned"), nullptr);
+    migrateOldState (tree);
     apvts.replaceState (tree);
     restoreLearned (learned);
+}
+
+void AutoEQAudioProcessor::migrateOldState (juce::ValueTree& tree)
+{
+    if (tree.getChildWithProperty ("id", "autoOn").isValid()) return;   // saved by a version with the switches
+    int mode = 0;
+    const auto m = tree.getChildWithProperty ("id", "mode");
+    if (m.isValid()) mode = juce::jlimit (0, numModes - 1, juce::roundToInt ((float) m.getProperty ("value", 0.0f)));
+    auto add = [&tree] (const char* pid, bool on)
+    {
+        juce::ValueTree p ("PARAM");
+        p.setProperty ("id", pid, nullptr);
+        p.setProperty ("value", on ? 1.0f : 0.0f, nullptr);
+        tree.appendChild (p, nullptr);
+    };
+    add ("autoOn", mode == autoMode);
+    add ("eqOn", mode == eqMode);
+    add ("spaceOn", mode == spaceMode);
 }
 
 juce::AudioProcessorEditor* AutoEQAudioProcessor::createEditor() { return new AutoEQAudioProcessorEditor (*this); }

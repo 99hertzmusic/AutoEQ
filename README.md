@@ -1,6 +1,6 @@
 # AutoEQ
 
-AutoEQ turns down the frequencies that ring, only while they ring. Switch to EQ for an 8-band EQ where any band can be dynamic, or to SPACE to carve room for a vocal or kick fed in on the sidechain.
+AutoEQ turns down the frequencies that ring, only while they ring (AUTO). It also has an 8-band EQ where any band can be dynamic (EQ), and SPACE, which carves room for a vocal or kick fed in on the sidechain. AUTO, EQ and SPACE each have an ON switch (the light on their key) and can run together: EQ first, then one spectral pass where AUTO and SPACE multiply, so the latency is the same whatever is on.
 
 Product page: https://99hertz.com/autoeq
 

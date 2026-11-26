@@ -36,7 +36,7 @@ void SpectralEngine::prepare (double sampleRate, int maxChannels)
         spec[c].assign ((size_t) N * 2, 0.0f);
         scSpec[c].assign ((size_t) N * 2, 0.0f);
     }
-    for (auto* v : { &prevRaw, &rise, &slowEx, &hold, &pDet, &levelDb, &env1, &envDb, &clipped, &excess, &target, &dil, &red, &scDb, &scSmooth, &mainDb, &gainNow, &tmp })
+    for (auto* v : { &prevRaw, &rise, &slowEx, &hold, &pDet, &levelDb, &env1, &envDb, &clipped, &excess, &target, &dil, &red, &scDb, &scSmooth, &mainDb, &gainNow, &tmp, &targetSp, &redSp, &gainSp })
         v->assign ((size_t) K + 1, 0.0f);
     prefix.assign ((size_t) K + 2, 0.0);
     sparseLevels = 1;
@@ -61,11 +61,13 @@ void SpectralEngine::reset()
     std::fill (slowEx.begin(), slowEx.end(), 0.0f);
     std::fill (hold.begin(), hold.end(), 0.0f);
     std::fill (red.begin(), red.end(), 0.0f);
+    std::fill (redSp.begin(), redSp.end(), 0.0f);
+    spaceActive = false;
     std::fill (levelDb.begin(), levelDb.end(), -140.0f);
     std::fill (scDb.begin(), scDb.end(), -140.0f);
     fill = 0;
     deltaNow = 0.0f; mixNow = 1.0f; scHold = 0.0f;
-    for (int i = 0; i < numDisplay; ++i) { dispIn[(size_t) i] = -140.0f; dispSc[(size_t) i] = -140.0f; dispRed[(size_t) i] = 0.0f; }
+    for (int i = 0; i < numDisplay; ++i) { dispIn[(size_t) i] = -140.0f; dispSc[(size_t) i] = -140.0f; dispRed[(size_t) i] = 0.0f; dispCarve[(size_t) i] = 0.0f; }
 }
 
 // ── Constant-Q helpers ────────────────────────────────────────────────────────
@@ -265,7 +267,7 @@ void SpectralEngine::computeSpaceTarget (const SpectralSettings& s)
     const float binHz = (float) (sr / N);
     if (! s.sidechainOk)
     {
-        std::fill (target.begin(), target.end(), 0.0f);
+        std::fill (targetSp.begin(), targetSp.end(), 0.0f);
         return;
     }
     smoothCQ (scDb.data(), scSmooth.data(), 0.12f, 2);
@@ -281,29 +283,43 @@ void SpectralEngine::computeSpaceTarget (const SpectralSettings& s)
         if (k == 0) t = 0.0f;
         tmp[(size_t) k] = t;
     }
-    smoothCQ (tmp.data(), target.data(), 0.08f, 1);
+    smoothCQ (tmp.data(), targetSp.data(), 0.08f, 1);
+}
+
+// LEARN's resonance measure (level above the smoothed envelope) when AUTO isn't computing it.
+void SpectralEngine::computeExcessOnly()
+{
+    const float envHalf = 0.36f;
+    smoothCQ (levelDb.data(), env1.data(), envHalf, 3);
+    for (int k = 0; k <= K; ++k) clipped[(size_t) k] = juce::jmin (levelDb[(size_t) k], env1[(size_t) k] + 1.5f);
+    smoothCQ (clipped.data(), envDb.data(), envHalf, 3);
+    float frameMax = -140.0f;
+    for (int k = 1; k <= K; ++k) frameMax = juce::jmax (frameMax, levelDb[(size_t) k]);
+    const float gate = juce::jmax (-100.0f, frameMax - 70.0f);
+    for (int k = 0; k <= K; ++k) excess[(size_t) k] = levelDb[(size_t) k] > gate ? levelDb[(size_t) k] - envDb[(size_t) k] : 0.0f;
 }
 
 // ── Display ──────────────────────────────────────────────────────────────────
-void SpectralEngine::exportDisplay (int mode)
+void SpectralEngine::exportDisplay()
 {
     const double binHz = sr / N;
-    float mx = 0.0f, mxHz = 1000.0f;
+    float mx = 0.0f, mxHz = 1000.0f, mxs = 0.0f, mxsHz = 1000.0f;
     for (int i = 0; i < numDisplay; ++i)
     {
         const double f = displayFreq (i);
         const double b0 = displayFreq (i) * std::pow (1000.0, -0.5 / (numDisplay - 1)) / binHz;
         const double b1 = displayFreq (i) * std::pow (1000.0, 0.5 / (numDisplay - 1)) / binHz;
-        float vin, vsc, vr;
+        float vin, vsc, vr, vs;
         const int k0 = (int) std::ceil (b0), k1 = juce::jmin (K, (int) std::floor (b1));
         if (k1 - k0 >= 1)
         {
-            vin = -140.0f; vsc = -140.0f; vr = 0.0f;
+            vin = -140.0f; vsc = -140.0f; vr = 0.0f; vs = 0.0f;
             for (int k = k0; k <= k1; ++k)
             {
                 vin = juce::jmax (vin, levelDb[(size_t) k]);
                 vsc = juce::jmax (vsc, scDb[(size_t) k]);
                 vr = juce::jmax (vr, red[(size_t) k]);
+                vs = juce::jmax (vs, redSp[(size_t) k]);
             }
         }
         else
@@ -313,14 +329,17 @@ void SpectralEngine::exportDisplay (int mode)
             vin = levelDb[(size_t) k] + t * (levelDb[(size_t) k + 1] - levelDb[(size_t) k]);
             vsc = scDb[(size_t) k] + t * (scDb[(size_t) k + 1] - scDb[(size_t) k]);
             vr = red[(size_t) k] + t * (red[(size_t) k + 1] - red[(size_t) k]);
+            vs = redSp[(size_t) k] + t * (redSp[(size_t) k + 1] - redSp[(size_t) k]);
         }
-        if (mode == eqMode) vr = 0.0f;
         dispIn[(size_t) i].store (vin, std::memory_order_relaxed);
         dispSc[(size_t) i].store (vsc, std::memory_order_relaxed);
         dispRed[(size_t) i].store (vr, std::memory_order_relaxed);
+        dispCarve[(size_t) i].store (vs, std::memory_order_relaxed);
         if (vr > mx) { mx = vr; mxHz = (float) f; }
+        if (vs > mxs) { mxs = vs; mxsHz = (float) f; }
     }
     maxCutDb.store (mx); maxCutHz.store (mxHz);
+    maxCarveDb.store (mxs); maxCarveHz.store (mxsHz);
     frameCount.fetch_add (1);
 }
 
@@ -464,42 +483,20 @@ void SpectralEngine::processFrame (const SpectralSettings& s)
         std::fill (scDb.begin(), scDb.end(), -140.0f);
 
     // Target cut per bin, then attack / release per bin.
+    // AUTO (its own cut). Off: the cut glides out in 30 ms, and LEARN still gets its resonance measure.
     float aA = coeff (atkMs), aR = coeff (relMs);
-    if (s.mode == autoMode) computeAutoTarget (s);
-    else if (s.mode == spaceMode)
-    {
-        computeSpaceTarget (s);
-        aA = coeff (8.0);
-        aR = coeff (400.0f * std::pow (40.0f / 400.0f, s.spSpeed));
-    }
+    if (s.autoOn) computeAutoTarget (s);
     else
     {
         std::fill (target.begin(), target.end(), 0.0f);
         aA = aR = coeff (30.0);
-        // excess for LEARN in EQ mode too
-        const float envHalf = 0.36f;
-        smoothCQ (levelDb.data(), env1.data(), envHalf, 3);
-        for (int k = 0; k <= K; ++k) clipped[(size_t) k] = juce::jmin (levelDb[(size_t) k], env1[(size_t) k] + 1.5f);
-        smoothCQ (clipped.data(), envDb.data(), envHalf, 3);
-        float frameMax = -140.0f;
-        for (int k = 1; k <= K; ++k) frameMax = juce::jmax (frameMax, levelDb[(size_t) k]);
-        const float gate = juce::jmax (-100.0f, frameMax - 70.0f);
-        for (int k = 0; k <= K; ++k) excess[(size_t) k] = levelDb[(size_t) k] > gate ? levelDb[(size_t) k] - envDb[(size_t) k] : 0.0f;
-    }
-    if (s.mode == spaceMode)
-    {
-        // LEARN still listens for resonances in SPACE mode
-        const float envHalf = 0.36f;
-        smoothCQ (levelDb.data(), env1.data(), envHalf, 3);
-        for (int k = 0; k <= K; ++k) clipped[(size_t) k] = juce::jmin (levelDb[(size_t) k], env1[(size_t) k] + 1.5f);
-        smoothCQ (clipped.data(), envDb.data(), envHalf, 3);
-        for (int k = 0; k <= K; ++k) excess[(size_t) k] = levelDb[(size_t) k] - envDb[(size_t) k];
+        computeExcessOnly();
     }
     for (int k = 0; k <= K; ++k)
     {
         const float t = target[(size_t) k], r = red[(size_t) k];
         red[(size_t) k] = r + (t - r) * (t > r ? aA : aR);
-        if (s.mode == autoMode && hold[(size_t) k] > 0.0f)
+        if (s.autoOn && hold[(size_t) k] > 0.0f)
         {
             // A hit: no cut in the frames that hold it (a cut there would ring out in front of the hit: pre-echo).
             red[(size_t) k] = 0.0f;
@@ -507,10 +504,28 @@ void SpectralEngine::processFrame (const SpectralSettings& s)
         }
     }
 
+    // SPACE (its own carve, own attack / release). Off: glides out in 30 ms, then is exactly 0.
+    if (s.spaceOn || spaceActive)
+    {
+        float sA = coeff (8.0), sR = coeff (400.0f * std::pow (40.0f / 400.0f, s.spSpeed));
+        if (s.spaceOn) computeSpaceTarget (s);
+        else { std::fill (targetSp.begin(), targetSp.end(), 0.0f); sA = sR = coeff (30.0); }
+        bool any = false;
+        for (int k = 0; k <= K; ++k)
+        {
+            const float t = targetSp[(size_t) k], r = redSp[(size_t) k];
+            float v = r + (t - r) * (t > r ? sA : sR);
+            if (! s.spaceOn && v < 1.0e-4f) v = 0.0f;
+            redSp[(size_t) k] = v;
+            any = any || v > 0.0f;
+        }
+        spaceActive = s.spaceOn || any;
+    }
+
     float frameMax = -140.0f;
     for (int k = 1; k <= K; ++k) frameMax = juce::jmax (frameMax, levelDb[(size_t) k]);
     learnAccumulate (frameMax > -60.0f);
-    exportDisplay (s.mode);
+    exportDisplay();
 
     // Mix / delta glide per frame (the overlap-add smooths it further).
     const float aMix = coeff (25.0);
@@ -519,18 +534,29 @@ void SpectralEngine::processFrame (const SpectralSettings& s)
     if (std::abs (mixNow - s.mix) < 1.0e-4f) mixNow = s.mix;
     if (std::abs (deltaNow - (s.delta ? 1.0f : 0.0f)) < 1.0e-4f) deltaNow = s.delta ? 1.0f : 0.0f;
 
+    // Gains, in the gain domain (no dry/wet sum, so no comb filtering). Linked: AUTO x SPACE on both channels.
+    // SPACE mid / side only: AUTO on both channels, SPACE's extra gain on the mid (or side) part.
+    const bool ms = nc == 2 && spaceActive && s.stereo != stereoLinked;
     for (int k = 0; k <= K; ++k)
     {
-        const float g = std::pow (10.0f, -red[(size_t) k] * 0.05f);
-        gainNow[(size_t) k] = 1.0f + mixNow * (g - 1.0f);   // the processed part's gain (1 = untouched)
+        if (! ms)
+        {
+            const float g = std::pow (10.0f, -(red[(size_t) k] + redSp[(size_t) k]) * 0.05f);
+            gainNow[(size_t) k] = 1.0f + mixNow * (g - 1.0f);   // the processed part's gain (1 = untouched)
+        }
+        else
+        {
+            const float gA = std::pow (10.0f, -red[(size_t) k] * 0.05f);
+            const float gS = std::pow (10.0f, -redSp[(size_t) k] * 0.05f);
+            gainNow[(size_t) k] = 1.0f + mixNow * (gA - 1.0f);  // both channels
+            gainSp[(size_t) k] = mixNow * gA * (gS - 1.0f);     // extra, on the mid / side part only
+        }
     }
-
-    const bool ms = nc == 2 && s.mode == spaceMode && s.stereo != stereoLinked;
     const float d = deltaNow;
     for (int k = 0; k <= K; ++k)
     {
         const float gm1 = gainNow[(size_t) k] - 1.0f;
-        if (gm1 == 0.0f && d == 0.0f) continue;
+        if (gm1 == 0.0f && d == 0.0f && (! ms || gainSp[(size_t) k] == 0.0f)) continue;
         // wet = dry + gm1 * (the part being processed); out = wet, or with DELTA what was taken away (dry - wet)
         if (! ms)
         {
@@ -549,8 +575,9 @@ void SpectralEngine::processFrame (const SpectralSettings& s)
             float& rr = spec[1][(size_t) (2 * k)]; float& ri = spec[1][(size_t) (2 * k + 1)];
             const float sgn = s.stereo == midOnly ? 1.0f : -1.0f;
             const float pr = 0.5f * (lr + sgn * rr), pi = 0.5f * (li + sgn * ri);   // mid or side
-            const float wlr = lr + gm1 * pr, wli = li + gm1 * pi;
-            const float wrr = rr + sgn * gm1 * pr, wri = ri + sgn * gm1 * pi;
+            const float gs = gainSp[(size_t) k];
+            const float wlr = lr + gm1 * lr + gs * pr, wli = li + gm1 * li + gs * pi;
+            const float wrr = rr + gm1 * rr + sgn * gs * pr, wri = ri + gm1 * ri + sgn * gs * pi;
             lr = wlr + d * (lr - 2.0f * wlr); li = wli + d * (li - 2.0f * wli);
             rr = wrr + d * (rr - 2.0f * wrr); ri = wri + d * (ri - 2.0f * wri);
         }
